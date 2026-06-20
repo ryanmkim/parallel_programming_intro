@@ -1,78 +1,129 @@
-// Parallel histogram with shared-memory privatization to cut global atomic contention.
-// Ryan Kim
-
 #include <iostream>
 #include <vector>
-#include <cstdlib>
-#include <ctime>
+#include <random>
+#include <cstdint>
+
 #include <cuda_runtime.h>
 
-__global__ void histogramShared(const int *data, int *hist, int n, int bins, int maxVal) {
-    extern __shared__ int local[];
+#define CUDA_CHECK(call)                                                       \
+    do {                                                                       \
+        cudaError_t err_ = (call);                                             \
+        if (err_ != cudaSuccess) {                                             \
+            std::cerr << "CUDA error " << cudaGetErrorString(err_)             \
+                      << " at " << __FILE__ << ":" << __LINE__ << "\n";        \
+            std::exit(EXIT_FAILURE);                                           \
+        }                                                                      \
+    } while (0)
 
-    for (int i = threadIdx.x; i < bins; i += blockDim.x)
-        local[i] = 0;
+template <int REPLICAS>
+__global__ void histogramShared(const int *__restrict__ data,
+                                unsigned int *__restrict__ hist,
+                                int n, int bins, int maxVal) {
+    extern __shared__ unsigned int smem[];
+    const int totalSlots = REPLICAS * bins;
+
+    for (int i = threadIdx.x; i < totalSlots; i += blockDim.x)
+        smem[i] = 0u;
     __syncthreads();
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        // data is 1..maxVal, map to [0, bins)
+    const int base = (threadIdx.x % REPLICAS) * bins;
+
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < n;
+         idx += blockDim.x * gridDim.x) {
         int bin = (data[idx] - 1) * bins / maxVal;
-        if (bin >= bins) bin = bins - 1;
-        if (bin < 0) bin = 0;
-        atomicAdd(&local[bin], 1);
+        bin = bin < 0 ? 0 : (bin >= bins ? bins - 1 : bin);
+        atomicAdd(&smem[base + bin], 1u);
     }
     __syncthreads();
 
-    for (int i = threadIdx.x; i < bins; i += blockDim.x)
-        atomicAdd(&hist[i], local[i]);
+    for (int b = threadIdx.x; b < bins; b += blockDim.x) {
+        unsigned int sum = 0u;
+        for (int r = 0; r < REPLICAS; ++r)
+            sum += smem[r * bins + b];
+        atomicAdd(&hist[b], sum);
+    }
+}
+
+static void cpuHistogram(const std::vector<int> &data, std::vector<unsigned int> &hist,
+                         int bins, int maxVal) {
+    std::fill(hist.begin(), hist.end(), 0u);
+    for (int v : data) {
+        int bin = (v - 1) * bins / maxVal;
+        bin = bin < 0 ? 0 : (bin >= bins ? bins - 1 : bin);
+        ++hist[bin];
+    }
 }
 
 int main() {
-    const int N = 10000000;
-    const int bins = 10;
+    const int N      = 10'000'000;
+    const int bins   = 10;
     const int maxVal = 1000;
+    constexpr int REPLICAS = 8;
+    const int    ITERS  = 20;
 
     std::vector<int> h_data(N);
-    std::vector<int> h_hist(bins, 0);
-
-    std::srand(std::time(nullptr));
+    std::mt19937 gen(std::random_device{}());
+    std::uniform_int_distribution<int> dist(1, maxVal);
     for (int i = 0; i < N; ++i)
-        h_data[i] = (std::rand() % maxVal) + 1;
+        h_data[i] = dist(gen);
 
-    int *d_data, *d_hist;
-    cudaMalloc(&d_data, N * sizeof(int));
-    cudaMalloc(&d_hist, bins * sizeof(int));
+    int          *d_data = nullptr;
+    unsigned int *d_hist = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_data, N * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_hist, bins * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), N * sizeof(int),
+                          cudaMemcpyHostToDevice));
 
-    cudaMemcpy(d_data, h_data.data(), N * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemset(d_hist, 0, bins * sizeof(int));
+    const int tpb = 256;
+    int numSMs = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0));
+    int coverage = (N + tpb - 1) / tpb;
+    int blocks   = std::min(coverage, numSMs * 32);
+    size_t shmem = static_cast<size_t>(REPLICAS) * bins * sizeof(unsigned int);
 
-    int tpb = 256;
-    int blocks = (N + tpb - 1) / tpb;
-    size_t shmem = bins * sizeof(int);
+    CUDA_CHECK(cudaMemset(d_hist, 0, bins * sizeof(unsigned int)));
+    histogramShared<REPLICAS><<<blocks, tpb, shmem>>>(d_data, d_hist, N, bins, maxVal);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
 
-    cudaEventRecord(start);
-    histogramShared<<<blocks, tpb, shmem>>>(d_data, d_hist, N, bins, maxVal);
-    cudaEventRecord(stop);
+    float totalMs = 0.0f;
+    for (int it = 0; it < ITERS; ++it) {
+        CUDA_CHECK(cudaMemset(d_hist, 0, bins * sizeof(unsigned int)));
+        CUDA_CHECK(cudaEventRecord(start));
+        histogramShared<REPLICAS><<<blocks, tpb, shmem>>>(d_data, d_hist, N, bins, maxVal);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        totalMs += ms;
+    }
+    CUDA_CHECK(cudaGetLastError());
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-        std::cerr << "CUDA error: " << cudaGetErrorString(err) << std::endl;
+    std::vector<unsigned int> h_hist(bins, 0u);
+    CUDA_CHECK(cudaMemcpy(h_hist.data(), d_hist, bins * sizeof(unsigned int),
+                          cudaMemcpyDeviceToHost));
 
-    cudaMemcpy(h_hist.data(), d_hist, bins * sizeof(int), cudaMemcpyDeviceToHost);
+    std::vector<unsigned int> ref(bins, 0u);
+    cpuHistogram(h_data, ref, bins, maxVal);
+    bool ok = (h_hist == ref);
 
-    cudaEventSynchronize(stop);
-    float ms = 0;
-    cudaEventElapsedTime(&ms, start, stop);
+    const float avgMs = totalMs / ITERS;
+    const double gelems = N / (avgMs * 1.0e6);
+    const double gbps   = (N * sizeof(int)) / (avgMs * 1.0e6);
 
-    std::cout << "N = " << N << ", bins = " << bins << "\n";
-    std::cout << "kernel time: " << ms << " ms\n\n";
+    std::cout << "N = " << N << ", bins = " << bins
+              << ", replicas = " << REPLICAS
+              << ", blocks = " << blocks << " (" << numSMs << " SMs)\n";
+    std::cout << "kernel time: " << avgMs << " ms (avg over " << ITERS << " runs)\n";
+    std::cout << "throughput:  " << gelems << " Gelem/s, "
+              << gbps << " GB/s read\n\n";
 
-    int total = 0;
+    unsigned long long total = 0;
     for (int i = 0; i < bins; ++i) {
         int lo = (i * maxVal) / bins + 1;
         int hi = ((i + 1) * maxVal) / bins;
@@ -80,10 +131,11 @@ int main() {
         total += h_hist[i];
     }
     std::cout << "\ntotal: " << total << " (expected " << N << ")\n";
+    std::cout << "verify: " << (ok ? "PASS" : "FAIL") << "\n";
 
-    cudaFree(d_data);
-    cudaFree(d_hist);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    return 0;
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaFree(d_data));
+    CUDA_CHECK(cudaFree(d_hist));
+    return ok ? 0 : 1;
 }
